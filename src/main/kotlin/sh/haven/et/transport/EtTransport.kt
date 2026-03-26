@@ -13,6 +13,7 @@ import java.io.Closeable
 import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.util.concurrent.Executors
 
 private const val TAG = "EtTransport"
 
@@ -55,7 +56,9 @@ class EtTransport(
     private var readJob: Job? = null
     private var writer: EtCrypto? = null
     private var reader: EtCrypto? = null
-    private val writeLock = Any()
+    private val writeExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "et-writer").apply { isDaemon = true }
+    }
 
     /**
      * Start the ET transport. Call from a coroutine scope.
@@ -155,17 +158,22 @@ class EtTransport(
      */
     fun sendInput(data: ByteArray) {
         if (closed) return
-        val w = writer ?: return
-        val out = outputStream ?: return
+        if (writer == null || outputStream == null) return
+        val copy = data.copyOf()
         try {
-            val payload = EtProtocol.encodeTerminalBuffer(data)
-            synchronized(writeLock) {
-                val encrypted = w.encrypt(payload)
-                EtProtocol.writeDataPacket(out, true, EtProtocol.HEADER_TERMINAL_BUFFER, encrypted)
+            writeExecutor.execute {
+                if (closed) return@execute
+                val w = writer ?: return@execute
+                val out = outputStream ?: return@execute
+                try {
+                    val payload = EtProtocol.encodeTerminalBuffer(copy)
+                    val encrypted = w.encrypt(payload)
+                    EtProtocol.writeDataPacket(out, true, EtProtocol.HEADER_TERMINAL_BUFFER, encrypted)
+                } catch (e: Exception) {
+                    if (!closed) logger.e(TAG, "Send error", e)
+                }
             }
-        } catch (e: Exception) {
-            if (!closed) logger.e(TAG, "Send error", e)
-        }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {}
     }
 
     /**
@@ -173,29 +181,44 @@ class EtTransport(
      */
     fun resize(cols: Int, rows: Int) {
         if (closed) return
-        val w = writer ?: return
-        val out = outputStream ?: return
+        if (writer == null || outputStream == null) return
         try {
-            val payload = EtProtocol.encodeTerminalInfo(rows = rows, cols = cols)
-            synchronized(writeLock) {
-                val encrypted = w.encrypt(payload)
-                EtProtocol.writeDataPacket(out, true, EtProtocol.HEADER_TERMINAL_INFO, encrypted)
+            writeExecutor.execute {
+                if (closed) return@execute
+                val w = writer ?: return@execute
+                val out = outputStream ?: return@execute
+                try {
+                    val payload = EtProtocol.encodeTerminalInfo(rows = rows, cols = cols)
+                    val encrypted = w.encrypt(payload)
+                    EtProtocol.writeDataPacket(out, true, EtProtocol.HEADER_TERMINAL_INFO, encrypted)
+                } catch (e: Exception) {
+                    if (!closed) logger.e(TAG, "Resize error", e)
+                }
             }
-        } catch (e: Exception) {
-            if (!closed) logger.e(TAG, "Resize error", e)
-        }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {}
     }
 
+    /** Send an encrypted packet on the IO thread (called from read loop). */
     private fun sendEncryptedPacket(out: OutputStream, header: Byte, plaintext: ByteArray) {
-        synchronized(writeLock) {
-            val encrypted = writer!!.encrypt(plaintext)
-            EtProtocol.writeDataPacket(out, true, header, encrypted)
-        }
+        // Called from the read loop (already on IO thread), must serialize with writeExecutor
+        try {
+            writeExecutor.execute {
+                if (closed) return@execute
+                val w = writer ?: return@execute
+                try {
+                    val encrypted = w.encrypt(plaintext)
+                    EtProtocol.writeDataPacket(out, true, header, encrypted)
+                } catch (e: Exception) {
+                    if (!closed) logger.e(TAG, "Send error", e)
+                }
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {}
     }
 
     override fun close() {
         if (closed) return
         closed = true
+        writeExecutor.shutdown()
         readJob?.cancel()
         try { socket?.close() } catch (_: Exception) {}
         socket = null
