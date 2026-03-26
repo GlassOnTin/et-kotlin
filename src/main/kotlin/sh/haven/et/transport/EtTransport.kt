@@ -14,6 +14,7 @@ import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 private const val TAG = "EtTransport"
 
@@ -73,6 +74,7 @@ class EtTransport(
                 val sock = Socket()
                 sock.connect(InetSocketAddress(serverHost, port), 10_000)
                 sock.tcpNoDelay = true
+                sock.soTimeout = 10_000  // Timeout for all handshake reads
                 socket = sock
                 outputStream = sock.getOutputStream()
 
@@ -103,9 +105,10 @@ class EtTransport(
                 writer = EtCrypto(keyBytes, EtCrypto.CLIENT_SERVER_NONCE_MSB)
                 reader = EtCrypto(keyBytes, EtCrypto.SERVER_CLIENT_NONCE_MSB)
 
-                // Phase 3: Send encrypted InitialPayload
+                // Phase 3: Send encrypted InitialPayload directly (already on IO thread, before read loop)
                 val initialPayload = EtProtocol.encodeInitialPayload(jumphost = false)
-                sendEncryptedPacket(output, EtProtocol.HEADER_INITIAL_PAYLOAD, initialPayload)
+                val encrypted = writer!!.encrypt(initialPayload)
+                EtProtocol.writeDataPacket(output, true, EtProtocol.HEADER_INITIAL_PAYLOAD, encrypted)
 
                 val (_, respHeader, respPayload) = EtProtocol.readDataPacket(input)
                 if (respHeader == EtProtocol.HEADER_INITIAL_RESPONSE) {
@@ -118,6 +121,9 @@ class EtTransport(
                 } else {
                     logger.d(TAG, "Unexpected header after InitialPayload: $respHeader")
                 }
+
+                // Clear handshake timeout for steady-state (keepalives handle liveness)
+                sock.soTimeout = 0
 
                 // Phase 4: Steady-state read loop
                 while (!closed) {
@@ -219,6 +225,7 @@ class EtTransport(
         if (closed) return
         closed = true
         writeExecutor.shutdown()
+        try { writeExecutor.awaitTermination(1, TimeUnit.SECONDS) } catch (_: Exception) {}
         readJob?.cancel()
         try { socket?.close() } catch (_: Exception) {}
         socket = null

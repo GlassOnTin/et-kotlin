@@ -67,7 +67,7 @@ object EtProtocol {
     fun readDataPacket(input: InputStream): Triple<Boolean, Byte, ByteArray> {
         val lenBuf = readExact(input, 4)
         val length = ByteBuffer.wrap(lenBuf).order(ByteOrder.BIG_ENDIAN).int
-        require(length in 2..128 * 1024 * 1024) { "Invalid data packet length: $length" }
+        require(length in 2..1_048_576) { "Invalid data packet length: $length" }
         val data = readExact(input, length)
         val encrypted = data[0].toInt() != 0
         val header = data[1]
